@@ -1,0 +1,2 @@
+## No external dependencies required.
+* **Uses Python standard libraries: tkinter, json, base64, shlex** (I mean there is nothing much for a final project...)
