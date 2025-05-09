@@ -2,7 +2,7 @@
 
 ## 1. Group Members & Contributions
 
-* **23BI14116	Nguyễn Tiến Dũng**
+* **23BI14116	Nguyễn Tiến Dũng** (Leader)
 * 23BI14105	Phạm Võ Toàn Đức
 * 23BI14059	Đoàn Xuân Bách
 * 23BI14031	Đào Quang Anh
