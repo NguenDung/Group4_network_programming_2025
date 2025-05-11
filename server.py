@@ -1,304 +1,375 @@
-import socket
-import threading
-import datetime
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Server v17d – multi-room chat, file-transfer (progress), pin/unpin, recall,
+friend-request (accept), block, invitefriend, detailed vertical /help,
+/clean chỉ ở menu, late-join thấy file-notice.
+"""
+
+import socket, threading, datetime, json, sys
 from collections import deque
-import json
 
-HOST = '127.0.0.1'
-PORT = 12345
+HOST, PORT, ENC = '127.0.0.1', 12345, 'utf-8'
 
-clients = {}
-user_rooms = {}
+# ──────────────── global state ────────────────
+clients, user_rooms = {}, {}
 rooms = {"room1": [], "room2": [], "room3": []}
-msg_id_counter = {r: 1 for r in rooms}
-history = {r: deque(maxlen=1000) for r in rooms}
-active_transfers = {}  # (client, filename) -> list of recipients
+msg_id   = {r: 1 for r in rooms}
+history  = {r: deque(maxlen=1000) for r in rooms}   # (id, sender, line)
+pins     = {r: [] for r in rooms}                   # (pin_no, id, line)
+pin_no   = {r: 1 for r in rooms}
+active   = {}                                       # (sock,fname)->{'rec':[…]}
 
-data_lock = threading.Lock()
+friends, blocks, pending = {}, {}, {}               # friend system
+lock = threading.Lock()
 
-def timestamp():
-    return datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+# ──────────────── helpers ──────────────────────
+def ts(fmt="[%H:%M:%S]"): return datetime.datetime.now().strftime(fmt)
+def safe(sock, data):
+    try: sock.sendall(data if isinstance(data,bytes) else data.encode(ENC))
+    except: pass
+def bc(room, line, exc=None):
+    with lock: rec = list(rooms.get(room, []))
+    for c in rec:
+        if c is not exc: safe(c, line + "\n")
+def bc_pkt(pkt, rec, exc=None):
+    data = (json.dumps(pkt) + "\n").encode(ENC)
+    for c in rec:
+        if c is not exc: safe(c, data)
+def snippet(line, n=60):
+    txt = line.split('»: ',1)[-1] if '»: ' in line else line.split(': ',1)[-1]
+    return (txt[:n] + "…") if len(txt) > n else txt
+def notify_friend(name, online=True):
+    msg = f"[Friend] {name} is now " + ("online" if online else "offline")
+    with lock:
+        for c,u in clients.items():
+            if name in friends.get(u,set()):
+                safe(c, msg + "\n")
 
-def broadcast_message(message, room, exclude=None):
-    with data_lock:
-        recipients = list(rooms.get(room, []))
-    for c in recipients:
-        if c != exclude:
-            try:
-                c.sendall((message + "\n").encode())
-            except:
-                pass
+# ──────────────── file-transfer ────────────────
+def ft_start(sock, p):
+    sender = clients[sock]
+    fname, size, to = p["filename"], p["size"], p.get("to")
+    with lock:
+        room = user_rooms[sock]
+        if not room:
+            safe(sock, "Join a room first.\n"); return
+        rec = [c for c,u in clients.items()
+               if (not to or u in to) and c in rooms[room]
+               and sender not in blocks.get(u,set())]
+        active[(sock,fname)] = {'rec': rec}
 
-def broadcast_packet(packet, recipients, exclude=None):
-    data = json.dumps(packet) + "\n"
-    for c in recipients:
-        if c != exclude:
-            try:
-                c.sendall(data.encode())
-            except:
-                pass
+        # log để người vào sau nhìn thấy đã gửi file gì
+        fid = msg_id[room]; msg_id[room] += 1
+        line = f"[FILE #{fid}] {sender} sent {fname} ({size} B)"
+        history[room].append((fid, sender, line))
 
-def handle_client(client, address):
-    try:
-        client.sendall(f"{timestamp()} Welcome! Please enter your username:\n".encode())
-        username = client.recv(1024).decode().strip()
-        with data_lock:
-            clients[client] = username
-            user_rooms[client] = None
-        print(f"{timestamp()} {username} connected from {address}")
-        client.sendall(f"{timestamp()} Hello {username}! Use /help to see commands.\n".encode())
+    bc(room, line)            # thông báo văn bản cho cả phòng
+    bc_pkt(p, rec, exc=sock)  # truyền dữ liệu cho người nhận
 
-        buffer = ""
-        while True:
-            data = client.recv(65536)
-            if not data:
-                break
-            buffer += data.decode()
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                if not line:
-                    continue
-                try:
-                    packet = json.loads(line)
-                    ptype = packet.get("type")
-                    if ptype == "file_start":
-                        handle_file_start(client, packet)
-                    elif ptype == "file_chunk":
-                        handle_file_chunk(client, packet)
-                    elif ptype == "msg":
-                        handle_private_msg(client, packet)
-                except json.JSONDecodeError:
-                    handle_text_message(client, line)
-    except Exception as e:
-        print(f"{timestamp()} Error: {e}")
-    finally:
-        disconnect_client(client)
+def ft_chunk(sock, p):
+    rec = active.get((sock,p["filename"]),{}).get("rec",[])
+    bc_pkt(p, rec, exc=sock)
 
-def handle_text_message(client, msg):
-    with data_lock:
-        room = user_rooms.get(client)
-    if msg.startswith("/"):
-        handle_command(client, msg, room)
-    else:
-        if room:
-            with data_lock:
-                mid = msg_id_counter[room]; msg_id_counter[room] += 1
-                ts = timestamp(); sender = clients[client]
-                history[room].append((mid, ts, sender, msg))
-            log = f"{ts} [MSG #{mid}] {sender}: {msg}"
-            broadcast_message(f"[MSG #{mid}] {sender}: {msg}", room)
-            print(log)
-        else:
-            client.sendall(f"{timestamp()} You must join a room to chat.\n".encode())
+def ft_end(sock, p):
+    rec = active.pop((sock,p["filename"]),{}).get("rec",[])
+    bc_pkt(p, rec, exc=sock)
 
-def handle_file_start(client, packet):
-    filename = packet["filename"]
-    to = packet.get("to")
-    with data_lock:
-        room = user_rooms.get(client)
-        if to:
-            recipients = [c for c,u in clients.items() if u in to and c in rooms.get(room,[])]
-        else:
-            recipients = list(rooms.get(room, []))
-        active_transfers[(client, filename)] = recipients
-    broadcast_packet(packet, recipients, exclude=client)
+# ──────────────── help text ────────────────────
+CAT = {"1":"menu","2":"chat","3":"file","4":"friend",
+       "menu":"menu","chat":"chat","file":"file","friend":"friend"}
 
-def handle_file_chunk(client, packet):
-    filename = packet["filename"]
-    with data_lock:
-        recipients = active_transfers.get((client, filename), [])
-    broadcast_packet(packet, recipients, exclude=client)
+def help_root():
+    return (
+        "Help categories (press 1-4 or /help <number>):\n"
+        "  1) menu   – commands outside any room\n"
+        "  2) chat   – commands inside a room\n"
+        "  3) file   – send / receive files & PM\n"
+        "  4) friend – add / block / invite friends\n"
+    )
 
-def handle_private_msg(client, packet):
-    to = packet.get("to", [])
-    recipients = [c for c,u in clients.items() if u in to]
-    broadcast_packet(packet, recipients, exclude=client)
+HELP = {
+"menu":(
+"/room               – list rooms\n"
+"/create <name>      – create room\n"
+"/join   <name>      – join room\n"
+"/rename <new>       – change username\n"
+"/delete <room>      – delete room\n"
+"/count              – user count per room\n"
+"/online             – total online users\n"
+"/clean              – clear screen (menu only)\n"
+"/quit               – logout"),
+"chat":(
+"/leave              – leave room\n"
+"/rename <new>       – change username\n"
+"/users              – list users in room\n"
+"/recall <id>        – recall *your* msg\n"
+"/reply <id> <txt>   – reply message\n"
+"/pin   <id>         – pin msg\n"
+"/pinned             – list pins\n"
+"/unpin <pin_no>     – remove pin\n"
+"/msg @User <txt>    – private message\n"
+"/invitefriend <usr> – invite friend to room"),
+"file":(
+"/sendfile           – any file\n"
+"/pic                – image (.jpg/.png)\n"
+"/mp3                – audio (.mp3/.wav)\n"
+"/mp4                – video (.mp4)\n"
+"/text               – text file (.txt)\n"
+"/gif <url>          – fetch & send GIF\n"
+"/open <file>        – open file\n"
+"/save <file>        – save skipped file"),
+"friend":(
+"/addfriend <usr>    – send request\n"
+"/acceptfriend <usr> – accept request\n"
+"/myfriends          – list friends\n"
+"/unfriend  <usr>    – remove friend\n"
+"/block     <usr>    – block/unblock user")
+}
 
-def handle_command(client, msg, room):
-    args = msg.split()
-    cmd = args[0]
+# ──────────────── command handler ──────────────
+def cmd(cli, text):
+    args = text.split(); cmd = args[0]
+    usr  = clients[cli]; room = user_rooms[cli]
+    tell = lambda m: safe(cli, f"{ts()} {m}\n")
 
+    # ----- help -----
     if cmd == "/help":
-        help_menu = (
-            "/room, /create [name], /join [name], /leave, /rename [name], /users, "
-            "/count, /online, /delete [room], /recall [id], /reply [id] [msg], "
-            "/sendfile [@user...], /msg @user... [text], /quit\n"
-        )
-        client.sendall(f"{timestamp()} {help_menu}".encode())
+        tell(help_root() if len(args)==1 else HELP.get(CAT.get(args[1].lower()),"Unknown")); return
+    if cmd in CAT: tell(HELP[CAT[cmd]]); return
 
-    elif cmd == "/room":
-        with data_lock:
-            room_list = ", ".join(rooms.keys())
-        client.sendall(f"{timestamp()} Available rooms: {room_list}\n".encode())
+    # client-side handled
+    if cmd in ("/sendfile","/pic","/mp3","/mp4","/text","/gif","/msg"):
+        return
 
-    elif cmd == "/create":
-        if len(args) < 2:
-            client.sendall(f"{timestamp()} Usage: /create [room_name]\n".encode())
+    # ===== menu =====
+    if cmd == "/room":  tell("Rooms: " + ", ".join(rooms)); return
+    if cmd == "/create":
+        if len(args)<2: tell("Usage: /create <room>"); return
+        r=args[1]
+        with lock:
+            if r in rooms: tell("Room exists"); return
+            rooms[r]=[]; msg_id[r]=1; history[r]=deque(maxlen=1000); pins[r]=[]; pin_no[r]=1
+        tell(f"Room '{r}' created."); return
+    if cmd == "/join":
+        if len(args)<2: tell("Usage: /join <room>"); return
+        r=args[1]
+        with lock:
+            if r not in rooms: tell("Room not found"); return
+            prev=user_rooms[cli]
+            if prev and cli in rooms[prev]: rooms[prev].remove(cli)
+            rooms[r].append(cli); user_rooms[cli]=r
+        safe(cli, f"{ts()} Joined {r}\n")
+        with lock:
+            for _i,_s,ln in history[r]: safe(cli, ln+"\n")
+            if pins[r]:
+                safe(cli,"-- PINNED --\n")
+                for no,_i,pl in pins[r]: safe(cli,f"{no}) {pl}\n")
+                safe(cli,"-------------\n")
+        bc(r, f"{ts()} **{usr} joined the room.**", exc=cli); return
+    if cmd == "/rename":
+        if len(args)<2: tell("Usage: /rename <new>"); return
+        new=args[1]
+        with lock:
+            if new in clients.values(): tell("Username taken"); return
+            friends[new]=friends.pop(usr,set()); blocks[new]=blocks.pop(usr,set()); pending[new]=pending.pop(usr,set())
+            clients[cli]=new; usr=new
+        tell(f"Renamed to {new}"); return
+    if cmd == "/delete":
+        if len(args)<2: tell("Usage: /delete <room>"); return
+        r=args[1]
+        with lock:
+            if r not in rooms: tell("Room not found"); return
+            for c in rooms[r]:
+                user_rooms[c]=None; safe(c,f"{ts()} Room '{r}' deleted\n")
+            del rooms[r]; msg_id.pop(r); history.pop(r); pins.pop(r); pin_no.pop(r)
+        tell(f"Room '{r}' deleted."); return
+    if cmd == "/count":
+        with lock: tell(", ".join(f"{r}:{len(lst)}" for r,lst in rooms.items())); return
+    if cmd == "/online":
+        with lock: tell(f"Online users: {len(clients)}"); return
+    if cmd == "/clean":
+        safe(cli, "\033c"); return
+    if cmd == "/quit":
+        safe(cli, "Bye!\n"); disconnect(cli); return
+
+    # ===== friend system =====
+    if cmd in ("/addfriend","/acceptfriend","/myfriends","/unfriend","/block","/invitefriend"):
+        with lock:
+            friends.setdefault(usr,set()); blocks.setdefault(usr,set()); pending.setdefault(usr,set())
+
+    if cmd == "/addfriend":
+        if len(args)<2: tell("Usage: /addfriend <user>"); return
+        target=args[1]
+        with lock: tgt_cli=next((c for c,u in clients.items() if u==target),None)
+        if not tgt_cli: tell("User not online."); return
+        if target in friends[usr] or usr in pending[target]:
+            tell("Already friends or pending."); return
+        pending[target].add(usr)
+        safe(tgt_cli, json.dumps({"type":"friendreq","from":usr})+"\n")
+        tell("Request sent."); return
+
+    if cmd == "/acceptfriend":
+        if len(args)<2: tell("Usage: /acceptfriend <user>"); return
+        req=args[1]
+        if req not in pending[usr]: tell("No pending request."); return
+        pending[usr].remove(req)
+        friends[usr].add(req); friends.setdefault(req,set()).add(usr)
+        with lock: req_cli=next((c for c,u in clients.items() if u==req),None)
+        if req_cli: safe(req_cli,f"[Friend] {usr} accepted your request.\n")
+        tell("Friend added."); return
+
+    if cmd == "/myfriends": tell("Friends: "+", ".join(sorted(friends[usr]) or ["(none)"])); return
+    if cmd == "/unfriend":
+        if len(args)<2: tell("Usage: /unfriend <user>"); return
+        tgt=args[1]; friends[usr].discard(tgt); friends.get(tgt,set()).discard(usr)
+        tell("Removed."); return
+    if cmd == "/block":
+        if len(args)<2: tell("Usage: /block <user>"); return
+        tgt=args[1]
+        if tgt in blocks[usr]:
+            blocks[usr].remove(tgt); tell(f"Unblocked {tgt}")
         else:
-            room_name = args[1]
-            with data_lock:
-                if room_name in rooms:
-                    exists = True
-                else:
-                    rooms[room_name] = []
-                    msg_id_counter[room_name] = 1
-                    history[room_name] = deque(maxlen=1000)
-                    exists = False
-            if exists:
-                client.sendall(f"{timestamp()} Room already exists.\n".encode())
-            else:
-                client.sendall(f"{timestamp()} Room '{room_name}' created successfully.\n".encode())
+            blocks[usr].add(tgt); tell(f"Blocked {tgt}")
+        return
+    if cmd == "/invitefriend":
+        if not room: tell("Join a room first."); return
+        if len(args)<2: tell("Usage: /invitefriend <user>"); return
+        tgt=args[1]
+        with lock: tgt_cli=next((c for c,u in clients.items() if u==tgt),None)
+        if tgt_cli:
+            safe(tgt_cli,json.dumps({"type":"invite","from":usr,"room":room})+"\n")
+            tell("Invite sent."); return
+        tell("User not online."); return
 
-    elif cmd == "/join":
-        if len(args) < 2:
-            client.sendall(f"{timestamp()} Usage: /join [room_name]\n".encode())
-        else:
-            room_name = args[1]
-            with data_lock:
-                if room_name not in rooms:
-                    client.sendall(f"{timestamp()} Room doesn't exist.\n".encode())
-                    return
-                prev_room = user_rooms[client]
-                if prev_room and client in rooms[prev_room]:
-                    rooms[prev_room].remove(client)
-                rooms[room_name].append(client)
-                user_rooms[client] = room_name
-            client.sendall(f"{timestamp()} Joined {room_name}.\n".encode())
-
-    elif cmd == "/leave":
-        if room:
-            with data_lock:
-                rooms[room].remove(client)
-                user_rooms[client] = None
-            client.sendall(f"{timestamp()} Left the room.\n".encode())
-        else:
-            client.sendall(f"{timestamp()} You are not in any room.\n".encode())
-
-    elif cmd == "/rename":
-        if len(args) < 2:
-            client.sendall(f"{timestamp()} Usage: /rename [new_name]\n".encode())
-        else:
-            new_name = args[1]
-            with data_lock:
-                old_name = clients[client]
-                clients[client] = new_name
-            client.sendall(f"{timestamp()} Renamed from {old_name} to {new_name}.\n".encode())
-
-    elif cmd == "/users":
-        if room:
-            with data_lock:
-                names = [clients[c] for c in rooms[room]]
-            client.sendall(f"{timestamp()} Users in {room}: {', '.join(names)}\n".encode())
-        else:
-            client.sendall(f"{timestamp()} You are not in a room.\n".encode())
-
-    elif cmd == "/count":
-        with data_lock:
-            cnt = ", ".join([f"{r}: {len(lst)}" for r,lst in rooms.items()])
-        client.sendall(f"{timestamp()} Room users count: {cnt}\n".encode())
-
-    elif cmd == "/online":
-        with data_lock:
-            total = len(clients)
-        client.sendall(f"{timestamp()} Total online users: {total}\n".encode())
-
-    elif cmd == "/delete":
-        if len(args) < 2:
-            client.sendall(f"{timestamp()} Usage: /delete [room_name]\n".encode())
-        else:
-            room_name = args[1]
-            with data_lock:
-                if room_name in rooms:
-                    for c in rooms[room_name]:
-                        user_rooms[c] = None
-                        c.sendall(f"{timestamp()} Room '{room_name}' was deleted.\n".encode())
-                    del rooms[room_name]
-                    del msg_id_counter[room_name]
-                    del history[room_name]
-                    deleted = True
-                else:
-                    deleted = False
-            if deleted:
-                client.sendall(f"{timestamp()} Room '{room_name}' deleted.\n".encode())
-            else:
-                client.sendall(f"{timestamp()} Room does not exist.\n".encode())
-
-    elif cmd == "/recall":
+    # ===== chat & file (need room) =====
+    if cmd in ("/leave","/users","/recall","/reply","/pin","/pinned","/unpin"):
         if not room:
-            client.sendall(f"{timestamp()} You are not in a room.\n".encode())
-        elif len(args) < 2:
-            client.sendall(f"{timestamp()} Usage: /recall [id]\n".encode())
-        else:
-            try:
-                rid = int(args[1])
-            except:
-                client.sendall(f"{timestamp()} Invalid message ID.\n".encode())
-                return
-            with data_lock:
-                rec = next((h for h in history[room] if h[0] == rid), None)
-                if rec:
-                    user_orig = rec[2]
-                    history[room] = deque([h for h in history[room] if h[0] != rid], maxlen=1000)
-            if rec:
-                broadcast_message(f"[MSG #{rid}] {user_orig} đã thu hồi tin nhắn.", room)
-                print(f"{timestamp()} [MSG #{rid}] {user_orig} đã thu hồi tin nhắn.")
-            else:
-                client.sendall(f"{timestamp()} Message ID {rid} not found.\n".encode())
+            tell("Join a room first."); return
 
-    elif cmd == "/reply":
-        if not room:
-            client.sendall(f"{timestamp()} You are not in a room.\n".encode())
-        elif len(args) < 3:
-            client.sendall(f"{timestamp()} Usage: /reply [id] [msg]\n".encode())
-        else:
-            try:
-                orig_id = int(args[1])
-            except:
-                client.sendall(f"{timestamp()} Invalid message ID.\n".encode())
-                return
-            reply_msg = " ".join(args[2:])
-            with data_lock:
-                rec = next((h for h in history[room] if h[0] == orig_id), None)
-            if not rec:
-                client.sendall(f"{timestamp()} Message ID {orig_id} not found.\n".encode())
-            else:
-                with data_lock:
-                    new_id = msg_id_counter[room]; msg_id_counter[room] += 1
-                    ts = timestamp(); sender = clients[client]
-                    history[room].append((new_id, ts, sender, reply_msg))
-                orig_user = rec[2]
-                log = f"{ts} [MSG #{new_id}] {sender} replied to [MSG #{orig_id}] {orig_user}: {reply_msg}"
-                broadcast_message(f"{log}", room)
-                print(log)
+    if cmd == "/leave":
+        with lock: rooms[room].remove(cli); user_rooms[cli]=None
+        safe(cli,f"{ts()} Left room\n"); bc(room,f"{ts()} **{usr} left.**",exc=cli); return
+    if cmd == "/users":
+        with lock: tell("Users: "+", ".join(clients[c] for c in rooms[room])); return
+    if cmd == "/recall":
+        if len(args)<2 or not args[1].isdigit(): tell("Usage: /recall <id>"); return
+        rid=int(args[1])
+        with lock:
+            idx,rec=next(((i,h) for i,h in enumerate(history[room]) if h[0]==rid),(None,None))
+            if not rec: tell("ID not found"); return
+            if rec[1]!=usr: tell("Only recall own msg"); return
+            history[room][idx]=(rid,usr,f"[MSG #{rid}] (recalled)")
+        bc(room,f"[MSG #{rid}] (recalled)"); return
+    if cmd == "/reply":
+        if len(args)<3 or not args[1].isdigit(): tell("Usage: /reply <id> <txt>"); return
+        oid=int(args[1]); txt=" ".join(args[2:])
+        with lock: orig=next((h for h in history[room] if h[0]==oid),None)
+        if not orig: tell("ID not found"); return
+        mid=msg_id[room]; msg_id[room]+=1
+        line=(f"[MSG #{mid}] {usr} reply {orig[1]} →#{oid} "
+              f"«{orig[1]}: {snippet(orig[2])}»: {txt}")
+        with lock: history[room].append((mid,usr,line))
+        bc(room,line); return
+    if cmd == "/pin":
+        if len(args)<2 or not args[1].isdigit(): tell("Usage: /pin <id>"); return
+        mid=int(args[1])
+        with lock: rec=next((h for h in history[room] if h[0]==mid),None)
+        if not rec: tell("ID not found"); return
+        no=pin_no[room]; pin_no[room]+=1; pins[room].append((no,mid,rec[2]))
+        bc(room,f"{ts()} **{usr} pinned message #{mid} (pin {no})**"); return
+    if cmd == "/pinned":
+        with lock: plist=pins[room][:]
+        if not plist: bc(room,"No pinned items."); return
+        bc(room,"-- PINNED LIST --")
+        for no,_i,pl in plist: bc(room,f"{no}) {pl}")
+        bc(room,"-----------------"); return
+    if cmd == "/unpin":
+        if len(args)<2 or not args[1].isdigit(): tell("Usage: /unpin <pin_no>"); return
+        no=int(args[1])
+        with lock:
+            if not any(p[0]==no for p in pins[room]): tell("Pin not found"); return
+            pins[room]=[p for p in pins[room] if p[0]!=no]
+        bc(room,f"{ts()} **{usr} unpinned item {no}**"); return
 
-    elif cmd == "/sendfile" or cmd == "/msg":
-        # Handled client-side
-        pass
+    tell("Unknown command.")
 
-    elif cmd == "/quit":
-        client.sendall(f"{timestamp()} Bye!\n".encode())
-        disconnect_client(client)
+# ──────────────── routing ────────────────────────
+def handle_text(cli,msg):
+    if msg.startswith("/"):
+        cmd(cli,msg); return
+    room=user_rooms[cli]
+    if not room:
+        safe(cli,"Join a room first\n"); return
+    mid=msg_id[room]; msg_id[room]+=1
+    line=f"[MSG #{mid}] {clients[cli]}: {msg}"
+    with lock: history[room].append((mid,clients[cli],line))
+    bc(room,line)
 
-    else:
-        client.sendall(f"{timestamp()} Unknown command. Type /help.\n".encode())
+def handle_private(cli,pk):
+    to=pk.get("to",[]); sender=clients[cli]
+    with lock:
+        rec=[c for c,u in clients.items() if u in to and sender not in blocks.get(u,set())]
+    bc_pkt(pk,rec,exc=cli)
 
-def disconnect_client(client):
-    with data_lock:
-        name = clients.pop(client, "Unknown")
-        room = user_rooms.pop(client, None)
-        if room and client in rooms.get(room, []):
-            rooms[room].remove(client)
-    print(f"{timestamp()} Disconnected: {name}")
-    try: client.close()
+# ──────────────── client thread ───────────────────
+def client_thread(sock,addr):
+    try:
+        # login
+        while True:
+            safe(sock,"Enter username:\n")
+            name=sock.recv(1024).decode(ENC).strip() or f"Anon{addr[1]}"
+            with lock:
+                if name not in clients.values(): break
+            safe(sock,"Username taken, try again.\n")
+        with lock:
+            clients[sock]=name; user_rooms[sock]=None
+            friends.setdefault(name,set()); blocks.setdefault(name,set()); pending.setdefault(name,set())
+        notify_friend(name,True)
+        safe(sock,f"{ts()} Hello {name}! Type /help\n")
+
+        buf=""
+        while True:
+            data=sock.recv(65536)
+            if not data: break
+            buf+=data.decode(ENC)
+            while "\n" in buf:
+                line,buf=buf.split("\n",1)
+                if not line: continue
+                try:
+                    obj=json.loads(line)
+                    if isinstance(obj,dict) and obj.get("type"):
+                        t=obj["type"]
+                        if t=="file_start": ft_start(sock,obj)
+                        elif t=="file_chunk": ft_chunk(sock,obj)
+                        elif t=="file_end": ft_end(sock,obj)
+                        elif t=="msg": handle_private(sock,obj)
+                    else:
+                        handle_text(sock,line)
+                except json.JSONDecodeError:
+                    handle_text(sock,line)
+    finally:
+        disconnect(sock)
+
+def disconnect(sock):
+    name=clients.pop(sock,"?")
+    notify_friend(name,False)
+    r=user_rooms.pop(sock,None)
+    with lock:
+        if r and sock in rooms.get(r,[]): rooms[r].remove(sock)
+    if r: bc(r,f"{ts()} **{name} disconnected.**",exc=sock)
+    try: sock.close()
     except: pass
 
+# ──────────────── main ───────────────────────────
 def main():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, PORT)); s.listen()
-        print(f"{timestamp()} Server running on {HOST}:{PORT}")
+    with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+        s.bind((HOST,PORT)); s.listen()
+        print(ts(),"Server listening",HOST,PORT)
         while True:
-            conn, addr = s.accept()
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            threading.Thread(target=client_thread,args=s.accept(),daemon=True).start()
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":
+    try: main()
+    except KeyboardInterrupt: sys.exit()
