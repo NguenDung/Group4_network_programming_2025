@@ -1,174 +1,205 @@
-import socket
-import threading
-import datetime
-import re
-import sys
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Client v14c – progress bar, GIF popup, /clean(menu), pop-up file (Open&Save /
+Save / Skip), friend & invite pop-up, help-shortcut 1-4.
+"""
+
+import socket, threading, datetime, json, base64, os, shlex, tempfile, subprocess, platform, shutil
 import tkinter as tk
-from tkinter import filedialog
-import json
-import base64
-import os
-import shlex
+from tkinter import filedialog, messagebox
+from urllib.request import urlretrieve
+from PIL import Image, ImageTk
+try: import readline
+except ImportError: readline=None
 
-HOST = '127.0.0.1'
-PORT = 12345
+HOST, PORT = '127.0.0.1', 12345
+CHUNK, BAR = 4096, 20
 
-username = ""
-room = None
-user_colors = {}
-file_receivers = {}
+username=""; current_room=[None]
+transfers, skipped, cmdq = {}, {}, []
 
-# Generate ANSI color code based on username hash (256-color)
-def get_color_for_user(user):
-    code = 16 + (abs(hash(user)) % 224)
-    return f"\033[38;5;{code}m"
-RESET_COLOR = "\033[0m"
+# ───── command groups ─────
+MENU={"/room","/create","/join","/rename","/delete","/count","/online","/clean","/quit"}
+CHAT={"/leave","/rename","/users","/recall","/reply","/pin","/pinned","/unpin","/msg","/invitefriend"}
+FILE={"/sendfile","/pic","/mp3","/mp4","/text","/gif","/open","/save"}
+FRI ={"/addfriend","/acceptfriend","/myfriends","/unfriend","/block"}
 
-# Timestamp only hour:minute
-def timestamp():
-    return datetime.datetime.now().strftime("[%H:%M]")
+ALL_CMDS=sorted(MENU|CHAT|FILE|FRI|{"/help"})
+if readline:
+    readline.parse_and_bind("tab: complete")
+    readline.set_completer(lambda t,s:[c for c in ALL_CMDS if c.startswith(t)][s]
+                           if s<len([c for c in ALL_CMDS if c.startswith(t)]) else None)
 
-# Print with tagged users highlighted
-def print_message(message):
-    def repl(match):
-        user = match.group(1)
-        if user not in user_colors:
-            user_colors[user] = get_color_for_user(user)
-        return f"{user_colors[user]}@{user}{RESET_COLOR}"
-    highlighted = re.sub(r"@(\w+)", repl, message)
-    print(highlighted, end='')
+def ts(): return datetime.datetime.now().strftime("[%H:%M]")
+def bar(p): f=int(p/BAR); return "#"*f+"."*(BAR-f)
+def sname(n): return n[:20]+"…" if len(n)>20 else n
 
-# Receive thread
-def receive_messages(sock):
-    buffer = ""
+# ───── pop-ups ─────
+def gif_popup(p):
+    img=Image.open(p); frames=[]
+    try:
+        while True:
+            frames.append(ImageTk.PhotoImage(img.copy())); img.seek(len(frames))
+    except EOFError: pass
+    root=tk.Tk(); root.title(os.path.basename(p)); lbl=tk.Label(root); lbl.pack()
+    delay=img.info.get("duration",100)
+    def loop(i=0): lbl.configure(image=frames[i]); root.after(delay,loop,(i+1)%len(frames))
+    loop(); root.mainloop()
+
+def open_file(p):
+    if p.lower().endswith(".gif"):
+        threading.Thread(target=gif_popup,args=(p,),daemon=True).start()
+    elif platform.system()=="Windows": os.startfile(p)
+    elif platform.system()=="Darwin": subprocess.Popen(["open",p])
+    else: subprocess.Popen(["xdg-open",p])
+
+def invite_popup(pk):
+    root=tk.Tk(); root.withdraw()
+    if messagebox.askyesno("Invite",f"{pk['from']} invites you to {pk['room']}.\nJoin?"):
+        cmdq.append(f"/join {pk['room']}")
+    root.destroy()
+
+def friend_popup(pk):
+    root=tk.Tk(); root.withdraw()
+    if messagebox.askyesno("Friend request",f"{pk['from']} wants to be friends.\nAccept?"):
+        cmdq.append(f"/acceptfriend {pk['from']}")
+    root.destroy()
+
+# ───── network receive ─────
+def send_json(s,o): s.sendall((json.dumps(o)+"\n").encode())
+
+def recv_thread(sock):
+    buf=""
     while True:
         try:
-            data = sock.recv(65536)
-            if not data:
-                break
-            buffer += data.decode()
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                if not line:
-                    continue
-                # JSON packet handling
+            d=sock.recv(65536)
+            if not d: print(ts(),"Disconnected"); break
+            buf+=d.decode()
+            while "\n" in buf:
+                line,buf=buf.split("\n",1)
+                if not line: continue
                 try:
-                    packet = json.loads(line)
-                    ptype = packet.get("type")
-                    if ptype == "file_start":
-                        fname = packet["filename"]
-                        size = packet["size"]
-                        sender = packet.get("from")
-                        print(f"{timestamp()} Receiving {fname} ({size} bytes) from {sender}")
-                        os.makedirs("downloads", exist_ok=True)
-                        fobj = open(os.path.join("downloads", fname), "wb")
-                        file_receivers[fname] = {'f': fobj, 'size': size, 'recv': 0}
-                    elif ptype == "file_chunk":
-                        fname = packet["filename"]
-                        rec = file_receivers.get(fname)
-                        if rec:
-                            try:
-                                chunk = base64.b64decode(packet["data"].encode())
-                                rec['f'].write(chunk)
-                                rec['recv'] += len(chunk)
-                                pct = rec['recv'] / rec['size'] * 100
-                                print(f"{timestamp()} Receiving {fname}: {pct:.2f}%")
-                                if rec['recv'] >= rec['size']:
-                                    rec['f'].close()
-                                    print(f"{timestamp()} File {fname} received.")
-                                    del file_receivers[fname]
-                            except Exception as e:
-                                print(f"{timestamp()} Error receiving chunk for {fname}: {e}")
-                    elif ptype == "msg":
-                        sender = packet.get("from")
-                        text = packet.get("text")
-                        print(f"{timestamp()} [PRIVATE] {sender}: {text}")
+                    pk=json.loads(line); t=pk.get("type")
+                    if t=="file_start": file_start(pk)
+                    elif t=="file_chunk": file_chunk(pk)
+                    elif t=="file_end": file_end(pk)
+                    elif t=="invite": invite_popup(pk)
+                    elif t=="friendreq": friend_popup(pk)
+                    elif t=="msg": print(f"{ts()} [PM] {pk['from']}: {pk['text']}")
                 except json.JSONDecodeError:
-                    # Plain text
-                    print_message(line + "\n")
-                except Exception as e:
-                    print(f"{timestamp()} Error processing incoming packet: {e}")
-        except Exception:
-            print(f"{timestamp()} Connection lost.")
-            break
+                    print(line)
+        except: break
 
-# Send thread
-def send_messages(sock):
-    global username
+def file_start(pk):
+    fn, sz, sender = pk["filename"], pk["size"], pk["from"]
+    root=tk.Tk(); root.withdraw()
+    choice = messagebox.askyesnocancel(
+        "Incoming file",
+        f"{sender} sent {fn} ({sz} B).\n"
+        "Yes = Open & Save   No = Save   Cancel = Skip"
+    )
+    keep = choice is not None
+    view = choice is True
+    root.destroy()
+    os.makedirs("downloads",exist_ok=True)
+    f=open(os.path.join("downloads",fn),"wb") if keep else tempfile.NamedTemporaryFile(delete=False)
+    transfers[fn]={"f":f,"got":0,"size":sz,"keep":keep,"view":view}
+
+def file_chunk(pk):
+    tr=transfers.get(pk["filename"])
+    if tr:
+        chunk=base64.b64decode(pk["data"]); tr["f"].write(chunk); tr["got"]+=len(chunk)
+        pct=tr["got"]/tr["size"]*100
+        print(f"\r{ts()} Recv {sname(pk['filename'])} [{bar(pct)}] {pct:5.1f}%",end="",flush=True)
+
+def file_end(pk):
+    fn=pk["filename"]; tr=transfers.pop(fn,None)
+    if tr:
+        tr["f"].close()
+        p=os.path.join("downloads",fn) if tr["keep"] else tr["f"].name
+        print(f"\r{ts()} Saved {fn}",' '*8)
+        if tr["view"]: open_file(p)
+        if not tr["keep"]: skipped[fn]=p
+
+# ───── send-file helpers ─────
+def transfer(sock,path,tags):
+    fn,sz=os.path.basename(path),os.path.getsize(path)
+    send_json(sock,{"type":"file_start","filename":fn,"size":sz,"to":tags,"from":username})
+    sent=0
+    with open(path,"rb") as fp:
+        while (chunk:=fp.read(CHUNK)):
+            sent+=len(chunk); pct=sent/sz*100
+            send_json(sock,{"type":"file_chunk","filename":fn,"data":base64.b64encode(chunk).decode(),"from":username})
+            print(f"\r{ts()} Send {sname(fn)} [{bar(pct)}] {pct:5.1f}%",end="",flush=True)
+    send_json(sock,{"type":"file_end","filename":fn,"from":username})
+    print(f"\r{ts()} File {fn} sent.",' '*8)
+
+def browse(ftype,tags,sock):
+    root=tk.Tk(); root.withdraw()
+    p=filedialog.askopenfilename(filetypes=[ftype]); root.destroy()
+    if p: transfer(sock,p,tags)
+
+def fetch_gif(sock,url,tags):
+    tmp=os.path.join(tempfile.gettempdir(), os.path.basename(url.split('/')[-1] or "tmp.gif"))
+    urlretrieve(url,tmp); transfer(sock,tmp,tags); os.remove(tmp)
+
+# ───── sender loop ─────
+def sender(sock):
+    FT={"/sendfile":("All","*.*"),
+        "/pic":     ("Images","*.jpg *.jpeg *.png"),
+        "/mp3":     ("Audio","*.mp3 *.wav"),
+        "/mp4":     ("Video","*.mp4"),
+        "/text":    ("Text","*.txt")}
     while True:
-        try:
-            raw = input(">> ")
-            parts = shlex.split(raw)
-            if not parts:
-                continue
-            cmd = parts[0]
-            if cmd == "/sendfile":
-                to_list = [p[1:] for p in parts[1:] if p.startswith("@")]
-                # File types filter: audio, pdf, text, images
-                root = tk.Tk(); root.withdraw()
-                file_path = filedialog.askopenfilename(
-                    filetypes=[
-                        ("Audio files", "*.mp3 *.wav"),
-                        ("PDF files", "*.pdf"),
-                        ("Text files", "*.txt"),
-                        ("Image files", "*.jpg *.jpeg *.png")
-                    ]
-                )
-                root.destroy()
-                if not file_path:
-                    continue
-                fname = os.path.basename(file_path)
-                size = os.path.getsize(file_path)
-                try:
-                    # Send header
-                    packet = {'type':'file_start','filename':fname,'size':size,'to':to_list,'from':username}
-                    sock.sendall((json.dumps(packet)+"\n").encode())
-                    sent = 0
-                    # Send chunks
-                    with open(file_path, "rb") as f:
-                        while True:
-                            chunk = f.read(4096)
-                            if not chunk:
-                                break
-                            packet = {'type':'file_chunk','filename':fname,'data':base64.b64encode(chunk).decode(),'from':username}
-                            sock.sendall((json.dumps(packet)+"\n").encode())
-                            sent += len(chunk)
-                            pct = sent / size * 100
-                            print(f"{timestamp()} Sending {fname}: {pct:.2f}%")
-                    print(f"{timestamp()} File {fname} sent.")
-                except Exception as e:
-                    print(f"{timestamp()} Error sending file {fname}: {e}")
-            elif cmd == "/msg":
-                to_list = [p[1:] for p in parts[1:] if p.startswith("@")]
-                text = " ".join([p for p in parts[1:] if not p.startswith("@")])
-                packet = {'type':'msg','to':to_list,'text':text,'from':username}
-                sock.sendall((json.dumps(packet)+"\n").encode())
-            else:
-                sock.sendall((raw+"\n").encode())
-                if cmd == "/quit":
-                    break
-        except Exception as e:
-            print(f"{timestamp()} Error processing command: {e}")
-            break
+        raw=cmdq.pop(0) if cmdq else input(">> ")
+        if raw in {"1","2","3","4"}: raw=f"/help {raw}"
+        if not raw: continue
 
-# Main
+        parts=shlex.split(raw); cmd=parts[0]
+        tags=[p[1:] for p in parts[1:] if p.startswith("@")]
+        room=current_room[0]
+
+        if cmd in CHAT|FILE and not room and cmd!="/rename":
+            print("Join a room first."); continue
+        if cmd=="/clean" and room:
+            print("Cannot /clean inside a room."); continue
+
+        if cmd in FT: browse(FT[cmd],tags,sock)
+        elif cmd=="/gif":
+            if len(parts)<2: print("Usage /gif <url>"); continue
+            fetch_gif(sock,parts[1],tags)
+        elif cmd=="/open":
+            if len(parts)<2: print("Usage /open <file>"); continue
+            fn=parts[1]
+            p=os.path.join("downloads",fn) if os.path.exists(os.path.join("downloads",fn)) else skipped.get(fn)
+            open_file(p) if p and os.path.exists(p) else print("File not found.")
+        elif cmd=="/save":
+            if len(parts)<2 or parts[1] not in skipped: print("Usage /save <skipped_file>"); continue
+            fn=parts[1]; os.makedirs("downloads",exist_ok=True)
+            shutil.move(skipped[fn],os.path.join("downloads",fn)); del skipped[fn]; print("Saved.")
+        elif cmd=="/clean":
+            os.system("cls" if platform.system()=="Windows" else "clear")
+            sock.sendall((cmd+"\n").encode())
+        elif cmd=="/msg":
+            txt=" ".join(p for p in parts[1:] if not p.startswith("@"))
+            send_json(sock,{"type":"msg","to":tags,"text":txt,"from":username})
+        else:
+            sock.sendall((raw+"\n").encode())
+            if cmd=="/join" and len(parts)>1: current_room[0]=parts[1]
+            if cmd=="/leave": current_room[0]=None
+            if cmd=="/quit": break
+
+# ───── main ─────
 def main():
     global username
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.connect((HOST, PORT))
-    except Exception:
-        print(f"{timestamp()} Cannot connect to server.")
-        sys.exit()
-    welcome = sock.recv(2048).decode()
-    print(welcome, end='')
-    username = input(">> ")
+    sock=socket.socket(); sock.connect((HOST,PORT))
+    print(sock.recv(1024).decode(),end='')
+    username=input(">> ").strip()
     sock.sendall((username+"\n").encode())
-    greeting = sock.recv(2048).decode()
-    print(greeting, end='')
-    threading.Thread(target=receive_messages, args=(sock,), daemon=True).start()
-    send_messages(sock)
-    sock.close()
+    print(sock.recv(1024).decode(),end='')
+    threading.Thread(target=recv_thread,args=(sock,),daemon=True).start()
+    sender(sock); sock.close()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
