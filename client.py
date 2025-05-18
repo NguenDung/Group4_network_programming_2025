@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Client v14c – progress bar, GIF popup, /clean(menu), pop-up file (Open&Save /
-Save / Skip), friend & invite pop-up, help-shortcut 1-4.
+Client v15 – +/pdf, async transfer thread, corruption check, forward support.
 """
 
 import socket, threading, datetime, json, base64, os, shlex, tempfile, subprocess, platform, shutil
@@ -20,12 +19,13 @@ username=""; current_room=[None]
 transfers, skipped, cmdq = {}, {}, []
 
 # ───── command groups ─────
-MENU={"/room","/create","/join","/rename","/delete","/count","/online","/clean","/quit"}
-CHAT={"/leave","/rename","/users","/recall","/reply","/pin","/pinned","/unpin","/msg","/invitefriend"}
-FILE={"/sendfile","/pic","/mp3","/mp4","/text","/gif","/open","/save"}
-FRI ={"/addfriend","/acceptfriend","/myfriends","/unfriend","/block"}
+MENU ={"/room","/create","/join","/rename","/delete","/count","/online","/clean","/quit"}
+CHAT ={"/leave","/rename","/users","/recall","/reply","/pin","/pinned","/unpin","/msg",
+       "/invitefriend","/forward"}
+FILE ={"/sendfile","/pic","/mp3","/mp4","/text","/gif","/pdf","/open","/save"}
+FRI  ={"/addfriend","/acceptfriend","/myfriends","/unfriend","/block"}
 
-ALL_CMDS=sorted(MENU|CHAT|FILE|FRI|{"/help"})
+ALL_CMDS = sorted(MENU|CHAT|FILE|FRI|{"/help"})
 if readline:
     readline.parse_and_bind("tab: complete")
     readline.set_completer(lambda t,s:[c for c in ALL_CMDS if c.startswith(t)][s]
@@ -115,12 +115,17 @@ def file_chunk(pk):
 
 def file_end(pk):
     fn=pk["filename"]; tr=transfers.pop(fn,None)
-    if tr:
-        tr["f"].close()
-        p=os.path.join("downloads",fn) if tr["keep"] else tr["f"].name
+    if not tr: return
+    tr["f"].close()
+    ok = tr["got"] == tr["size"]
+    p = os.path.join("downloads",fn) if tr["keep"] else tr["f"].name
+    if ok:
         print(f"\r{ts()} Saved {fn}",' '*8)
         if tr["view"]: open_file(p)
         if not tr["keep"]: skipped[fn]=p
+    else:
+        print(f"\r{ts()} ERROR: {fn} corrupted (expected {tr['size']}, got {tr['got']})",' '*8)
+        if not tr["keep"]: os.remove(p)
 
 # ───── send-file helpers ─────
 def transfer(sock,path,tags):
@@ -130,7 +135,8 @@ def transfer(sock,path,tags):
     with open(path,"rb") as fp:
         while (chunk:=fp.read(CHUNK)):
             sent+=len(chunk); pct=sent/sz*100
-            send_json(sock,{"type":"file_chunk","filename":fn,"data":base64.b64encode(chunk).decode(),"from":username})
+            send_json(sock,{"type":"file_chunk","filename":fn,
+                            "data":base64.b64encode(chunk).decode(),"from":username})
             print(f"\r{ts()} Send {sname(fn)} [{bar(pct)}] {pct:5.1f}%",end="",flush=True)
     send_json(sock,{"type":"file_end","filename":fn,"from":username})
     print(f"\r{ts()} File {fn} sent.",' '*8)
@@ -138,11 +144,14 @@ def transfer(sock,path,tags):
 def browse(ftype,tags,sock):
     root=tk.Tk(); root.withdraw()
     p=filedialog.askopenfilename(filetypes=[ftype]); root.destroy()
-    if p: transfer(sock,p,tags)
+    if p:
+        threading.Thread(target=transfer,args=(sock,p,tags),daemon=True).start()
 
 def fetch_gif(sock,url,tags):
     tmp=os.path.join(tempfile.gettempdir(), os.path.basename(url.split('/')[-1] or "tmp.gif"))
-    urlretrieve(url,tmp); transfer(sock,tmp,tags); os.remove(tmp)
+    urlretrieve(url,tmp)
+    transfer(sock,tmp,tags)
+    os.remove(tmp)
 
 # ───── sender loop ─────
 def sender(sock):
@@ -150,7 +159,8 @@ def sender(sock):
         "/pic":     ("Images","*.jpg *.jpeg *.png"),
         "/mp3":     ("Audio","*.mp3 *.wav"),
         "/mp4":     ("Video","*.mp4"),
-        "/text":    ("Text","*.txt")}
+        "/text":    ("Text","*.txt"),
+        "/pdf":     ("PDF","*.pdf")}
     while True:
         raw=cmdq.pop(0) if cmdq else input(">> ")
         if raw in {"1","2","3","4"}: raw=f"/help {raw}"
@@ -160,15 +170,16 @@ def sender(sock):
         tags=[p[1:] for p in parts[1:] if p.startswith("@")]
         room=current_room[0]
 
-        if cmd in CHAT|FILE and not room and cmd!="/rename":
+        if cmd in CHAT|FILE and not room and cmd not in {"/rename","/forward"}:
             print("Join a room first."); continue
         if cmd=="/clean" and room:
             print("Cannot /clean inside a room."); continue
 
-        if cmd in FT: browse(FT[cmd],tags,sock)
+        if cmd in FT:
+            browse(FT[cmd],tags,sock)
         elif cmd=="/gif":
             if len(parts)<2: print("Usage /gif <url>"); continue
-            fetch_gif(sock,parts[1],tags)
+            threading.Thread(target=fetch_gif,args=(sock,parts[1],tags),daemon=True).start()
         elif cmd=="/open":
             if len(parts)<2: print("Usage /open <file>"); continue
             fn=parts[1]
