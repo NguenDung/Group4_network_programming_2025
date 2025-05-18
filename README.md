@@ -1,129 +1,135 @@
-# Network Programming Final Project – Multimedia Chat System
+# Network Programming Final Project – **Multimedia Chat System**
 
-## 1. Group Members & Contributions
+---
 
-* **23BI14116 Nguyễn Tiến Dũng** (Leader)
-* 23BI14105 Phạm Võ Toàn Đức
-* 23BI14059 Đoàn Xuân Bách
-* 23BI14031 Đào Quang Anh
-* 23BI14029 Lê Nam Anh
-* 23BI14006 Nguyễn Hoàng An
+## 1 · Group Members & Contributions
 
-## 2. Build & Run Instructions
+| Student ID    | Name                          | Key Responsibilities                          |
+| ------------- | ----------------------------- | --------------------------------------------- |
+| **23BI14116** | **Nguyễn Tiến Dũng** (Leader) | Server architecture, `/help` UX, thread model |
+| 23BI14105     | Phạm Võ Toàn Đức              | Client CLI loop, Tk pop-ups, progress bars    |
+| 23BI14059     | Đoàn Xuân Bách                | File-transfer framing, history replay         |
+| 23BI14031     | Đào Quang Anh                 | Reply / recall / pin / forward logic          |
+| 23BI14029     | Lê Nam Anh                    | Friend system, invite workflow                |
+| 23BI14006     | Nguyễn Hoàng An               | Thread-safety, error handling, `/clean`       |
 
-1. **Requirements**: Python 3.x, `tkinter` (pre-installed on Linux/Mac).
-2. **Dependencies** (install via `requirements.txt` if updated):
+---
+
+## 2 · Build & Run Instructions
+
+1. **Prerequisites**
+
+   * Python ≥ 3.8
+   * `tkinter` (built-in on Win/macOS · `sudo apt install python3-tk` on Ubuntu)
+   * Pillow  -- install once:
 
    ```bash
-   pip install -r requirements.txt  # currently only Pillow
+   pip install Pillow
    ```
-3. **Start the server**:
+
+2. **Start the server**
 
    ```bash
    cd server
-   python3 server.py
+   python3 server.py          # default 127.0.0.1:12345
    ```
-4. **Start the client(s)**:
+
+3. **Start one or more clients**
 
    ```bash
    cd client
    python3 client.py
    ```
 
-## 3. Features Implemented
+---
 
-### 3.1. Core Chat & Room Management
+## 3 · Feature Matrix
 
-* **Rooms**: `/room`, `/create <name>`, `/join <name>`, `/leave`, `/delete <name>`, `/count`, `/online`, `/quit`
-* **Help & UI**: `/help` with vertical lists + shortcuts `1–4`; `/clean` only works outside rooms
-* **Messaging**:
-
-  * Public chat broadcast (`[MSG #id] User: text`)
-  * Private messaging: `/msg @user [text]`
-  * Reply: `/reply <id> <text>` (`reply User →#id`)
-  * Recall: `/recall <id>` (only own messages)
-
-### 3.2. File & Multimedia Support
-
-* **Transfer commands**:
-
-  * `/sendfile` (any file)
-  * `/pic`, `/mp3`, `/mp4`, `/text` (filter by extension)
-  * `/gif <url>` fetch & send GIFs
-* **Progress bars**: ASCII bar for send/receive chunks
-* **GUI pop-up** on receive with **Open & Save / Save / Skip**
-* **View & Save**: `/open <file>`, `/save <filename>` for skipped files
-* **Late-join users** see history including `[FILE #id] User sent name (size B)` notices
-
-### 3.3. Message Management
-
-* **Pin/unpin**: `/pin <id>`, `/pinned`, `/unpin <pin_no>` with global notifications
-* **History sync**: new users receive full chat + pinned list on `/join`
-
-### 3.4. Friend System & Invites
-
-* **Commands**: `/addfriend <user>`, `/acceptfriend <user>`, `/myfriends`, `/unfriend <user>`, `/block <user>`
-* **Notifications**: GUI pop-up for friend requests + server text for accept; online/offline pings
-* **Invite**: `/invitefriend <user>` with GUI pop-up to join current room
-
-### 3.5. Advanced & Misc
-
-* **ANSI-color**: highlights `@username` in 256-color palette
-* **Tab completion**: for all commands in client
-* **Thread safety**: `threading.Lock()` for shared state
-* **Graceful disconnect**: ping/pong removed stale, broadcast offline messages
-
-## 4. Protocol & Data Formats
-
-1. **Text**: UTF-8 plain text (newline-delimited)
-2. **JSON packets** (newline-delimited):
-
-   * **file\_start**:
-
-     ```json
-     { "type": "file_start", "filename": "<name>", "size": <bytes>, "to": ["user"...], "from": "<sender>" }
-     ```
-   * **file\_chunk**:
-
-     ```json
-     { "type": "file_chunk", "filename": "<name>", "data": "<base64>", "from": "<sender>" }
-     ```
-   * **file\_end**:
-
-     ```json
-     { "type": "file_end", "filename": "<name>", "from": "<sender>" }
-     ```
-   * **msg** (private):
-
-     ```json
-     { "type": "msg", "to": ["user"...], "text": "<msg>", "from": "<sender>" }
-     ```
-   * **invite** / **friendreq**:
-
-     ```json
-     { "type": "invite", "from": "<sender>", "room": "<room>" }
-     { "type": "friendreq", "from": "<sender>" }
-     ```
-3. **Framing**: each packet ends with `\n` for clear boundaries
-
-## 5. Known Limitations & Future Improvements
-
-* Transition to SHA‑256 + retry logic for file integrity
-* Persistent storage of rooms/history/pins (DB)
-* Full GUI or web client for richer UX
-* Authentication & authorization, end-to-end encryption
-* CI/CD, unit tests, Docker/K8s deployment
-* Real-time voice/video integration via WebRTC
-
-## 6. Contributors
-
-* **Nguyễn Tiến Dũng (23BI14116)**: Leader, server architecture, `/help` logic
-* **Phạm Võ Toàn Đức (23BI14105)**: Client-side I/O, pop-ups, progress bars
-* **Đoàn Xuân Bách (23BI14059)**: File-transfer protocol and history sync
-* **Đào Quang Anh (23BI14031)**: Message management (reply, recall, pin)
-* **Lê Nam Anh (23BI14029)**: Friend-system, invite GUI
-* **Nguyễn Hoàng An (23BI14006)**: Thread safety, error handling, clean command
+| Domain            | Highlights & Commands                                                                              |
+| ----------------- | -------------------------------------------------------------------------------------------------- |
+| **Room Mgmt**     | `/room`, `/create`, `/join`, `/leave`, `/delete`, `/count`, `/online`, `/quit`                     |
+| **Help/UX**       | `/help` with numbered pages **1-4** · TAB-completion · `/clean` (menu only)                        |
+| **Messaging**     | Broadcast with `[MSG #id]`.   DM → `/msg @user text`                                               |
+|                   | **Reply** `/reply <id> text` · **Recall** `/recall <id>`                                           |
+|                   | **Pin** `/pin`, list `/pinned`, remove `/unpin`                                                    |
+|                   | **Forward** any message/file notice to another room: `/forward <id> <room>` (tagged “FWD by User”) |
+| **Files & Media** | Send: `/sendfile`, `/pic`, `/mp3`, `/mp4`, `/text`, **`/pdf`**, `/gif <url>`                       |
+|                   | ASCII progress bars · 50 MB server limit · corruption check (byte-count)                           |
+|                   | GUI choice on receive **Open & Save / Save / Skip**; later `/open`, `/save`                        |
+| **Friend System** | `/addfriend`, `/acceptfriend`, `/myfriends`, `/unfriend`, `/block`                                 |
+|                   | Online/offline alerts · `/invitefriend` with GUI pop-up                                            |
+| **Tech**          | Thread-per-client server (lock-protected), threaded uploads on client                              |
 
 ---
 
-*End of README*
+## 4 · Protocol Overview
+
+* **Plain text lines** – chat & commands, UTF-8, newline terminated.
+* **JSON packets** – one per line (`\n` framing).
+
+| Packet type  | Mandatory fields                            |
+| ------------ | ------------------------------------------- |
+| `file_start` | `filename`, `size`, `from`, *optional* `to` |
+| `file_chunk` | `filename`, `data` (base64), `from`         |
+| `file_end`   | `filename`, `from`                          |
+| `msg` (DM)   | `to` (list), `text`, `from`                 |
+| `invite`     | `room`, `from`                              |
+| `friendreq`  | `from`                                      |
+
+---
+
+## 5 · Internal Mechanisms
+
+* **Thread model**
+
+  * **Server**: one thread / client + global `Lock` for all shared dicts.
+  * **Client**: reader thread + CLI thread; each file upload in its own thread (non-blocking).
+
+* **File transfer**
+
+  * Base64 4 kB chunks inside JSON.
+  * Receiver writes to disk, tracks `got` vs `size`; mismatch → “ERROR corrupted”.
+  * Active transfers table cleaned when sender disconnects.
+
+* **History**
+
+  * Each room stores last 1000 items; auto-increment `msg_id`.
+  * On `/join`, server replays history then pinned list.
+
+* **Safety limits**
+
+  * Upload size > 50 MB → server rejects.
+  * `/block` prevents DM & file delivery from blocked user.
+
+---
+
+## 6 · Known Limitations & Future Work
+
+| Area        | Current state         | Improvement idea                                 |
+| ----------- | --------------------- | ------------------------------------------------ |
+| Security    | Plain TCP             | TLS (`ssl`), end-to-end encryption               |
+| Integrity   | Byte-count check only | SHA-256 checksum + automatic re-request          |
+| Persistence | All state in RAM      | Persist rooms/history/friends to SQLite or Redis |
+| Scalability | Thread-per-client     | Migrate to `asyncio` or epoll                    |
+| UX          | Text-based            | Full GUI/Web (React + WebSocket)                 |
+| Media       | File uploads only     | Live voice/video via WebRTC                      |
+
+---
+
+## 7 · Build Log & Tests
+
+| Test                                         | Result                                     |
+| -------------------------------------------- | ------------------------------------------ |
+| 3 clients chat / swap rooms                  | OK                                         |
+| Mixed jpg / mp3 / pdf upload (under 50 MB)   | Progress & save verified                   |
+| Send > 50 MB file                            | Server replies “File exceeds 50 MB limit.” |
+| Corrupt transfer (kill sender mid-file)      | Receiver prints *ERROR corrupted*          |
+| Friend request + invite                      | Pop-ups & room join OK                     |
+| `/forward` message & file notice room1→room2 | Arrives with “FWD by” tag                  |
+
+*Environment*: Python 3.12 • Windows 11 & Ubuntu 22.04
+
+---
+
+> *README generated 18 May 2025 for code versions:*
+> **client v15** | **server v18-fix**
